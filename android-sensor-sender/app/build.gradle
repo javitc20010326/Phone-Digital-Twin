@@ -1,0 +1,16 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "local.codex.redmisensors"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "local.codex.redmisensors"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "0.1"
+    }
+}

@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sensores Redmi</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #07090d;
+        color: #f6f8fb;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 18px;
+        background: linear-gradient(145deg, #07090d, #121922 58%, #15140f);
+      }
+      main {
+        width: min(100%, 520px);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 10px;
+        padding: 22px;
+        background: rgba(10, 14, 18, 0.92);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 25px;
+      }
+      p {
+        margin: 0 0 16px;
+        color: #aeb9c4;
+        line-height: 1.45;
+      }
+      button {
+        width: 100%;
+        min-height: 48px;
+        border: 0;
+        border-radius: 8px;
+        background: #e8eef5;
+        color: #080c10;
+        font: inherit;
+        font-weight: 800;
+      }
+      .status {
+        margin: 16px 0;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 12px;
+        color: #dbe7f3;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+      }
+      .cell {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .cell span {
+        display: block;
+        color: #8795a3;
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .cell strong {
+        display: block;
+        margin-top: 8px;
+        font-size: 20px;
+      }
+      code {
+        color: #8fd3ff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Sensores del movil</h1>
+      <p>
+        Esta pagina solo envia sensores a la app local del PC. El modelo 3D no esta
+        en la web: se renderiza en tu ordenador.
+      </p>
+      <button id="start">Iniciar sensores</button>
+      <div class="status" id="status">Esperando permiso.</div>
+      <div class="grid">
+        <div class="cell"><span>Alpha</span><strong id="alpha">--</strong></div>
+        <div class="cell"><span>Beta</span><strong id="beta">--</strong></div>
+        <div class="cell"><span>Gamma</span><strong id="gamma">--</strong></div>
+      </div>
+      <p style="margin-top: 16px">
+        Si no envia datos, usa una app UDP de sensores y manda al PC puerto
+        <code>5005</code> con Rotation Vector u Orientation.
+      </p>
+    </main>
+    <script>
+      const start = document.querySelector("#start");
+      const statusBox = document.querySelector("#status");
+      const fields = {
+        alpha: document.querySelector("#alpha"),
+        beta: document.querySelector("#beta"),
+        gamma: document.querySelector("#gamma"),
+      };
+      let active = false;
+      let lastOrientationSent = 0;
+      let lastMotionSent = 0;
+      let receivedEvents = 0;
+      let sensorObject = null;
+      let activeMode = "";
+      let lastStatusAt = 0;
+      const params = new URLSearchParams(location.search);
+      const preferredMode = params.get("mode") || "generic";
+
+      writeDiagnostics();
+
+      window.addEventListener("load", () => {
+        if (
+          typeof window.DeviceOrientationEvent?.requestPermission !== "function" &&
+          typeof window.DeviceMotionEvent?.requestPermission !== "function"
+        ) {
+          beginSensors();
+        }
+      });
+
+      start.addEventListener("click", async () => {
+        start.disabled = true;
+        start.textContent = "Iniciando...";
+        try {
+          await requestPermissions();
+          beginSensors();
+        } catch (error) {
+          statusBox.textContent = error.message;
+          start.disabled = false;
+          start.textContent = "Reintentar";
+        }
+      });
+
+      function beginSensors() {
+        if (active) return;
+        if (preferredMode === "generic" && "AbsoluteOrientationSensor" in window) {
+          startGenericSensorIfAvailable();
+        } else {
+          window.addEventListener("deviceorientation", onOrientation, true);
+        }
+        window.addEventListener("devicemotion", onMotion, true);
+        active = true;
+        start.disabled = true;
+        start.textContent = "Sensores activos";
+        statusBox.textContent = "Sensores activos. Esperando movimiento...";
+        setTimeout(() => {
+          if (receivedEvents === 0) {
+            statusBox.innerHTML =
+              "Android/Chrome no esta entregando eventos. Si ves <b>contexto seguro: no</b>, Chrome puede bloquear sensores por HTTP LAN. Usa USB/ADB reverse o app UDP.";
+            start.disabled = false;
+            start.textContent = "Reintentar";
+          }
+        }, 2500);
+      }
+
+      async function requestPermissions() {
+        if (!("DeviceOrientationEvent" in window) && !("DeviceMotionEvent" in window) && !("AbsoluteOrientationSensor" in window)) {
+          throw new Error("Este navegador no expone sensores de movimiento.");
+        }
+
+        const requests = [];
+        if (typeof window.DeviceOrientationEvent?.requestPermission === "function") {
+          requests.push(window.DeviceOrientationEvent.requestPermission(true));
+        }
+        if (typeof window.DeviceMotionEvent?.requestPermission === "function") {
+          requests.push(window.DeviceMotionEvent.requestPermission());
+        }
+        const results = await Promise.all(requests);
+        if (results.some((result) => result !== "granted")) {
+          throw new Error("Permiso de sensores denegado.");
+        }
+      }
+
+      async function startGenericSensorIfAvailable() {
+        if (!("AbsoluteOrientationSensor" in window)) {
+          window.addEventListener("deviceorientation", onOrientation, true);
+          return;
+        }
+
+        try {
+          sensorObject = new AbsoluteOrientationSensor({ frequency: 30, referenceFrame: "device" });
+          sensorObject.addEventListener("reading", () => {
+            if (activeMode && activeMode !== "generic") return;
+            activeMode = "generic";
+            receivedEvents += 1;
+            const now = performance.now();
+            if (now - lastOrientationSent < 16) return;
+            lastOrientationSent = now;
+            const q = sensorObject.quaternion;
+            postPayload({
+              type: "absolute_orientation_sensor",
+              quaternion: Array.from(q),
+              sentAt: Date.now(),
+            });
+            setStatus("Enviando AbsoluteOrientationSensor al PC.");
+          });
+          sensorObject.addEventListener("error", (event) => {
+            statusBox.textContent = `AbsoluteOrientationSensor bloqueado: ${event.error?.message || "sin detalle"}`;
+          });
+          sensorObject.start();
+        } catch (error) {
+          statusBox.textContent = `AbsoluteOrientationSensor no disponible: ${error.message}`;
+          window.addEventListener("deviceorientation", onOrientation, true);
+        }
+      }
+
+      function onOrientation(event) {
+        if (!active) return;
+        if (event.absolute && !new URLSearchParams(location.search).has("absolute")) return;
+        if (activeMode && activeMode !== "orientation") return;
+        activeMode = "orientation";
+        receivedEvents += 1;
+        const payload = {
+          type: "deviceorientation",
+          alpha: clean(event.alpha),
+          beta: clean(event.beta),
+          gamma: clean(event.gamma),
+          absolute: Boolean(event.absolute),
+          compassHeading: clean(event.webkitCompassHeading),
+          sentAt: Date.now(),
+        };
+
+        fields.alpha.textContent = fmt(payload.alpha);
+        fields.beta.textContent = fmt(payload.beta);
+        fields.gamma.textContent = fmt(payload.gamma);
+
+        const now = performance.now();
+        if (now - lastOrientationSent < 16) return;
+        lastOrientationSent = now;
+        postPayload(payload);
+      }
+
+      function onMotion(event) {
+        if (!active) return;
+        const acceleration = event.acceleration;
+        const gravity = event.accelerationIncludingGravity;
+        const rotation = event.rotationRate;
+        const payload = {
+          type: "devicemotion",
+          acceleration: vector(acceleration),
+          accelerationIncludingGravity: vector(gravity),
+          rotationRate: vector(rotation),
+          interval: clean(event.interval),
+          sentAt: Date.now(),
+        };
+        const now = performance.now();
+        if (now - lastMotionSent < 33) return;
+        lastMotionSent = now;
+        postPayload(payload);
+      }
+
+      function postPayload(payload) {
+        fetch("/sensor", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        })
+          .then(() => {
+            setStatus(`Enviando sensores al PC (${activeMode || payload.type}).`);
+          })
+          .catch(() => {
+            setStatus("No puedo enviar al PC. Revisa USB/ADB reverse.");
+          });
+      }
+
+      function setStatus(message) {
+        const now = performance.now();
+        if (now - lastStatusAt < 1000) return;
+        lastStatusAt = now;
+        statusBox.textContent = message;
+      }
+
+      function writeDiagnostics() {
+        const lines = [
+          `Android: ${/Android/i.test(navigator.userAgent) ? "si" : "no"}`,
+          `Chrome: ${/Chrome/i.test(navigator.userAgent) ? "si" : "no"}`,
+          `contexto seguro: ${window.isSecureContext ? "si" : "no"}`,
+          `DeviceOrientationEvent: ${"DeviceOrientationEvent" in window ? "si" : "no"}`,
+          `DeviceMotionEvent: ${"DeviceMotionEvent" in window ? "si" : "no"}`,
+          `AbsoluteOrientationSensor: ${"AbsoluteOrientationSensor" in window ? "si" : "no"}`,
+        ];
+        statusBox.innerHTML = lines.join("<br>");
+      }
+
+      function clean(value) {
+        return Number.isFinite(value) ? value : 0;
+      }
+
+      function vector(source) {
+        if (!source) return null;
+        return {
+          x: clean(source.x ?? source.alpha),
+          y: clean(source.y ?? source.beta),
+          z: clean(source.z ?? source.gamma),
+        };
+      }
+
+      function fmt(value) {
+        return Number.isFinite(value) ? `${value.toFixed(0)}°` : "--";
+      }
+    </script>
+  </body>
+</html>

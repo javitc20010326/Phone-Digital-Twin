@@ -1,0 +1,24 @@
+# Local toolchains and downloaded archives
+tools/
+platform-tools/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Android / Gradle
+android-sensor-sender/.gradle/
+android-sensor-sender/app/build/
+android-sensor-sender/build/
+android-sensor-sender/.idea/
+*.iml
+
+# Local generated data
+*.log
+*.err
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

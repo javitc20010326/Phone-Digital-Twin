@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Digital Twin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f14;
+      --panel: rgba(12, 18, 24, 0.78);
+      --line: rgba(148, 163, 184, 0.24);
+      --text: #e8eef5;
+      --muted: #9eacba;
+      --green: #2ee67a;
+      --amber: #f6b94b;
+      --cyan: #75d7ff;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      background: radial-gradient(circle at 50% 20%, #15202a 0%, var(--bg) 48%, #07090d 100%);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+
+    canvas { display: block; width: 100vw; height: 100vh; }
+
+    .hud {
+      position: fixed;
+      left: 22px;
+      top: 18px;
+      width: min(540px, calc(100vw - 44px));
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      border-radius: 8px;
+      box-shadow: 0 18px 70px rgba(0, 0, 0, 0.34);
+      pointer-events: none;
+    }
+
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 9px;
+    }
+
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--amber);
+      box-shadow: 0 0 20px var(--amber);
+      flex: 0 0 auto;
+    }
+
+    .dot.live {
+      background: var(--green);
+      box-shadow: 0 0 20px var(--green);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 5px 12px;
+      font: 12px/1.35 Consolas, "SFMono-Regular", monospace;
+      color: var(--muted);
+    }
+
+    .grid strong {
+      color: var(--text);
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+
+    .controls {
+      position: fixed;
+      left: 22px;
+      bottom: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-width: calc(100vw - 44px);
+    }
+
+    button {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 12px;
+      color: var(--text);
+      background: rgba(16, 24, 32, 0.82);
+      font: 600 12px "Segoe UI", system-ui, sans-serif;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: rgba(117, 215, 255, 0.55); }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <section class="hud">
+    <div class="title"><span id="liveDot" class="dot"></span><span>Phone Digital Twin - Xiaomi Redmi Note 13 Pro</span></div>
+    <div class="grid">
+      <span>estado</span><strong id="status">esperando sensores</strong>
+      <span>paquetes</span><strong id="packets">0</strong>
+      <span>sensor</span><strong id="sensorType">--</strong>
+      <span>centro</span><strong id="centerMode">bloqueado, solo giros</strong>
+      <span>atajo</span><strong id="shortcutStatus">P+Q 2s activa/pausa</strong>
+      <span>endpoint APK</span><strong>http://127.0.0.1:8876/sensor</strong>
+    </div>
+  </section>
+  <div class="controls">
+    <button id="calibrate">Calibrar</button>
+    <button id="resetCalibration">Reset calibracion</button>
+    <button id="resetView">Reset vista</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("scene");
+    const ctx = canvas.getContext("2d");
+    const liveDot = document.getElementById("liveDot");
+    const statusEl = document.getElementById("status");
+    const packetsEl = document.getElementById("packets");
+    const sensorTypeEl = document.getElementById("sensorType");
+    const centerModeEl = document.getElementById("centerMode");
+    const shortcutStatusEl = document.getElementById("shortcutStatus");
+
+    const state = {
+      matrix: [[1,0,0],[0,1,0],[0,0,1]],
+      targetMatrix: [[1,0,0],[0,1,0],[0,0,1]],
+      rawMatrix: [[1,0,0],[0,1,0],[0,0,1]],
+      calibration: [[1,0,0],[0,1,0],[0,0,1]],
+      calibrated: false,
+      motion: {},
+      packets: 0,
+      lastType: "",
+      age: null,
+      serverActive: true,
+      lastFrame: performance.now(),
+      lastHudUpdate: 0,
+      pollInFlight: false,
+      pressedKeys: new Set(),
+      shortcutTimer: null,
+      yaw: -0.22,
+      pitch: -0.16,
+      zoom: 4.6,
+      dragging: null
+    };
+
+    const model = buildPhoneModel();
+
+    function resize() {
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      canvas.width = Math.floor(innerWidth * dpr);
+      canvas.height = Math.floor(innerHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    addEventListener("resize", resize);
+    resize();
+
+    function identity() { return [[1,0,0],[0,1,0],[0,0,1]]; }
+    function transpose(m) { return [[m[0][0],m[1][0],m[2][0]],[m[0][1],m[1][1],m[2][1]],[m[0][2],m[1][2],m[2][2]]]; }
+    function matMul(a, b) {
+      return a.map((row, r) => row.map((_, c) => a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c]));
+    }
+    function matVec(m, v) {
+      return [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]
+      ];
+    }
+    function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+    function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]]; }
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function len(v) { return Math.hypot(v[0], v[1], v[2]); }
+    function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+    function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+    function normalize(v) {
+      const l = len(v);
+      return l > 1e-9 ? [v[0] / l, v[1] / l, v[2] / l] : [1, 0, 0];
+    }
+    function vAdd(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+    function vScale(v, s) { return [v[0]*s, v[1]*s, v[2]*s]; }
+    function vLerp(a, b, t) { return [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)]; }
+    function matrixLerp(a, b, t) {
+      return orthonormalize(a.map((row, r) => row.map((value, c) => lerp(value, b[r][c], t))));
+    }
+    function orthonormalize(m) {
+      const x = normalize([m[0][0], m[1][0], m[2][0]]);
+      const yRaw = [m[0][1], m[1][1], m[2][1]];
+      const xy = dot(x, yRaw);
+      const y = normalize([yRaw[0] - xy * x[0], yRaw[1] - xy * x[1], yRaw[2] - xy * x[2]]);
+      const z = cross(x, y);
+      return [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]];
+    }
+    function roundedRectPoints(hw, hh, radius, segments) {
+      const centers = [
+        [hw - radius, hh - radius, 0, Math.PI / 2],
+        [-hw + radius, hh - radius, Math.PI / 2, Math.PI],
+        [-hw + radius, -hh + radius, Math.PI, Math.PI * 1.5],
+        [hw - radius, -hh + radius, Math.PI * 1.5, Math.PI * 2]
+      ];
+      const points = [];
+      for (const [cx, cy, start, end] of centers) {
+        for (let i = 0; i <= segments; i++) {
+          const a = start + (end - start) * i / segments;
+          points.push([cx + Math.cos(a) * radius, cy + Math.sin(a) * radius]);
+        }
+      }
+      return points;
+    }
+
+    function buildPhoneModel() {
+      const width = 74.24, height = 161.15, depth = 7.98;
+      const boundary = roundedRectPoints(width / 2, height / 2, 8, 7);
+      const vertices = [];
+      for (const z of [depth / 2, -depth / 2]) {
+        for (const [x, y] of boundary) vertices.push([x, y, z]);
+      }
+      const n = boundary.length;
+      const faces = [
+        { points: [...Array(n).keys()], fill: "#071018", outline: "#9fb2bf", kind: "front" },
+        { points: [...Array(n).keys()].map(i => i + n).reverse(), fill: "#d9f0e9", outline: "#8da59d", kind: "back" }
+      ];
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        faces.push({ points: [i, j, j + n, i + n], fill: "#a9c5bf", outline: "#6e8580", kind: "side" });
+      }
+      return { width, height, depth, vertices, faces };
+    }
+
+    async function pollState() {
+      if (state.pollInFlight) return;
+      state.pollInFlight = true;
+      try {
+        const response = await fetch("/state", { cache: "no-store" });
+        const data = await response.json();
+        if (Array.isArray(data.matrix)) {
+          state.rawMatrix = data.matrix;
+          state.targetMatrix = matMul(state.calibration, state.rawMatrix);
+        }
+        state.motion = data.motion || {};
+        state.packets = data.received || 0;
+        state.lastType = data.lastType || data.raw?.type || "";
+        state.age = data.age;
+        state.serverActive = data.active !== false;
+      } catch (_err) {
+        state.age = null;
+      } finally {
+        state.pollInFlight = false;
+      }
+    }
+    setInterval(pollState, 16);
+    pollState();
+
+    function vectorFromObject(value) {
+      if (!value) return null;
+      if (Array.isArray(value)) return [Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0];
+      return [Number(value.x) || 0, Number(value.y) || 0, Number(value.z) || 0];
+    }
+
+    function transform(point) {
+      const rotated = matVec(state.matrix, point);
+      return matVec(matMul(rotX(state.pitch), rotY(state.yaw)), rotated);
+    }
+
+    function project(point) {
+      const focal = 900;
+      const centerX = innerWidth * 0.54;
+      const centerY = innerHeight * 0.52;
+      const perspective = focal / Math.max(180, focal - point[2] + 220);
+      const scale = state.zoom * perspective;
+      return [centerX + point[0] * scale, centerY - point[1] * scale, point[2]];
+    }
+
+    function drawBackground() {
+      const w = innerWidth, h = innerHeight;
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, "#101820");
+      g.addColorStop(0.58, "#0b1016");
+      g.addColorStop(1, "#07090d");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+      const cx = w * 0.54, cy = h * 0.74;
+      ctx.strokeStyle = "rgba(91, 121, 142, 0.18)";
+      ctx.lineWidth = 1;
+      for (let i = -12; i <= 12; i++) {
+        line(cx - 560, cy + i * 22, cx + 560, cy + i * 22);
+        line(cx + i * 44, cy - 280, cx + i * 44, cy + 280);
+      }
+      ctx.strokeStyle = "rgba(117, 215, 255, 0.22)";
+      ctx.setLineDash([6, 7]);
+      ctx.strokeRect(cx - 530, h * 0.52 - 330, 1060, 660);
+      ctx.setLineDash([]);
+    }
+
+    function drawPhone() {
+      const transformed = model.vertices.map(transform);
+      const projected = transformed.map(project);
+      const faces = model.faces.map(face => ({
+        face,
+        depth: face.points.reduce((sum, i) => sum + transformed[i][2], 0) / face.points.length
+      })).sort((a, b) => a.depth - b.depth);
+
+      for (const item of faces) {
+        const pts = item.face.points.map(i => projected[i]);
+        polygon(pts, shade(item.face), item.face.outline, 1.2);
+      }
+      drawDetails();
+    }
+
+    function shade(face) {
+      if (face.kind === "front") return "#061018";
+      if (face.kind === "back") return "#d9f0e9";
+      return face.fill;
+    }
+
+    function planePoint(x, y, z) {
+      return project(transform([x, y, z]));
+    }
+    function planePoly(x, y, w, h, z, r = 0, seg = 5) {
+      let pts;
+      if (r <= 0) {
+        const hw = w / 2, hh = h / 2;
+        pts = [[x-hw,y-hh,z],[x+hw,y-hh,z],[x+hw,y+hh,z],[x-hw,y+hh,z]];
+      } else {
+        pts = roundedRectPoints(w / 2, h / 2, r, seg).map(p => [x + p[0], y + p[1], z]);
+      }
+      return pts.map(p => project(transform(p)));
+    }
+    function planeCircle(x, y, radius, z, segments = 36) {
+      const pts = [];
+      for (let i = 0; i < segments; i++) {
+        const a = Math.PI * 2 * i / segments;
+        pts.push(project(transform([x + Math.cos(a) * radius, y + Math.sin(a) * radius, z])));
+      }
+      return pts;
+    }
+
+    function drawDetails() {
+      const frontNormal = matVec(matMul(rotX(state.pitch), rotY(state.yaw)), matVec(state.matrix, [0, 0, 1]));
+      if (frontNormal[2] > 0) {
+        const z = model.depth / 2 + 0.25;
+        polygon(planePoly(0, 0, 66, 150, z, 5), "#05070a", "#a7b8c5", 1.2);
+        polygon(planePoly(0, 0, 60, 140, z + 0.06, 3), "#071a29", "");
+        polygon(planePoly(-15, 18, 28, 82, z + 0.08, 2), "#123d5a", "");
+        polygon(planePoly(16, -26, 25, 66, z + 0.08, 2), "#131d32", "");
+        polygon(planePoly(0, -61, 48, 12, z + 0.11, 2), "#0f2a3f", "#24485d");
+        polygon(planeCircle(0, 69, 2.3, z + 0.14), "#05070a", "#3c4a55");
+      } else {
+        const z = -model.depth / 2 - 0.28;
+        polygon(planePoly(0, 0, 69, 151, z, 6), "#d7eee7", "#8aa59c", 1.5);
+        polygon(planePoly(-16, 47, 35, 54, z - 0.12, 5), "#edf7f3", "#829992", 1.5);
+        polygon(planePoly(15, -8, 26, 126, z - 0.07, 5), "#c7e2da", "");
+        polygon(planeCircle(-25, 60, 8.4, z - 0.24), "#050607", "#68727b", 2.1);
+        polygon(planeCircle(-25, 60, 5.2, z - 0.31), "#101820", "#243847", 1.1);
+        polygon(planeCircle(-25, 60, 2.0, z - 0.36), "#8fb8ca", "");
+        polygon(planeCircle(-8, 60, 5.4, z - 0.2), "#080b0d", "#74818d", 1.3);
+        polygon(planeCircle(-25, 39, 5.9, z - 0.2), "#080b0d", "#74818d", 1.3);
+        polygon(planeCircle(-8, 39, 3.4, z - 0.2), "#f5d47c", "#806f3a", 1);
+        textAt("200MP", planePoint(-16.5, 23, z - 0.25), "#5c6c72", "700 8px Segoe UI");
+        textAt("Redmi", planePoint(5, -51, z - 0.18), "#6d817c", "700 14px Segoe UI");
+        textAt("5G", planePoint(5, -62, z - 0.18), "#8da09a", "700 8px Segoe UI");
+      }
+    }
+
+    function polygon(points, fill, stroke, width = 1) {
+      ctx.beginPath();
+      points.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+      ctx.closePath();
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = width; ctx.stroke(); }
+    }
+    function line(x1, y1, x2, y2) {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    function textAt(text, point, fill, font) {
+      ctx.save();
+      ctx.fillStyle = fill;
+      ctx.font = font;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, point[0], point[1]);
+      ctx.restore();
+    }
+
+    function updateHud() {
+      const now = performance.now();
+      if (now - state.lastHudUpdate < 120) return;
+      state.lastHudUpdate = now;
+      const live = state.serverActive && Number.isFinite(state.age) && state.age < 1.2;
+      liveDot.classList.toggle("live", live);
+      statusEl.textContent = state.serverActive ? (live ? "recibiendo sensores en vivo" : "esperando paquetes de la APK") : "pausado por P+Q";
+      packetsEl.textContent = String(state.packets);
+      sensorTypeEl.textContent = state.lastType || "--";
+      centerModeEl.textContent = state.calibrated ? "calibrado, solo giros" : "bloqueado, solo giros";
+      shortcutStatusEl.textContent = state.serverActive ? "P+Q 2s para pausar" : "P+Q 2s para reanudar";
+    }
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now - state.lastFrame) / 1000);
+      state.lastFrame = now;
+      state.matrix = matrixLerp(state.matrix, state.targetMatrix, Math.min(1, dt * 18));
+      drawBackground();
+      drawPhone();
+      updateHud();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    canvas.addEventListener("pointerdown", event => {
+      state.dragging = { x: event.clientX, y: event.clientY, yaw: state.yaw, pitch: state.pitch };
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", event => {
+      if (!state.dragging) return;
+      state.yaw = state.dragging.yaw + (event.clientX - state.dragging.x) * 0.008;
+      state.pitch = clamp(state.dragging.pitch + (event.clientY - state.dragging.y) * 0.008, -1.3, 1.3);
+    });
+    canvas.addEventListener("pointerup", () => { state.dragging = null; });
+    canvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      state.zoom = clamp(state.zoom * (event.deltaY < 0 ? 1.08 : 0.92), 2.4, 12);
+    }, { passive: false });
+
+    document.getElementById("calibrate").addEventListener("click", () => {
+      state.calibration = transpose(state.rawMatrix);
+      state.targetMatrix = identity();
+      state.matrix = identity();
+      state.calibrated = true;
+    });
+    document.getElementById("resetCalibration").addEventListener("click", () => {
+      state.calibration = identity();
+      state.targetMatrix = state.rawMatrix;
+      state.calibrated = false;
+    });
+    document.getElementById("resetView").addEventListener("click", () => { state.yaw = -0.22; state.pitch = -0.16; state.zoom = 4.6; });
+
+    async function toggleServerActive() {
+      try {
+        const response = await fetch("/control", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "toggle" })
+        });
+        const data = await response.json();
+        state.serverActive = data.active !== false;
+        shortcutStatusEl.textContent = state.serverActive ? "reactivado" : "pausado";
+      } catch (_err) {
+        shortcutStatusEl.textContent = "fallo al cambiar estado";
+      }
+    }
+
+    function updateShortcutState() {
+      const held = state.pressedKeys.has("p") && state.pressedKeys.has("q");
+      if (held && !state.shortcutTimer) {
+        shortcutStatusEl.textContent = "manteniendo P+Q...";
+        state.shortcutTimer = setTimeout(() => {
+          state.shortcutTimer = null;
+          toggleServerActive();
+        }, 2000);
+      } else if (!held && state.shortcutTimer) {
+        clearTimeout(state.shortcutTimer);
+        state.shortcutTimer = null;
+        shortcutStatusEl.textContent = state.serverActive ? "P+Q 2s para pausar" : "P+Q 2s para reanudar";
+      }
+    }
+
+    window.addEventListener("keydown", event => {
+      const key = event.key.toLowerCase();
+      if (key === "p" || key === "q") {
+        state.pressedKeys.add(key);
+        updateShortcutState();
+      }
+    });
+    window.addEventListener("keyup", event => {
+      const key = event.key.toLowerCase();
+      if (key === "p" || key === "q") {
+        state.pressedKeys.delete(key);
+        updateShortcutState();
+      }
+    });
+  </script>
+</body>
+</html>

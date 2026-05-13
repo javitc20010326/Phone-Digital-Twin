@@ -41,6 +41,7 @@ catch {
 
 $excludeDirs = @("\tools\", "\platform-tools\", "\__pycache__\", "\.git\", "\.gradle\", "\app\build\", "\build\")
 $excludeFiles = @("platform-tools-latest-windows.zip")
+$excludePatterns = @("*.log", "*.tmp")
 
 $files = Get-ChildItem -Path $Root -Recurse -File | Where-Object {
     $path = $_.FullName
@@ -50,12 +51,21 @@ $files = Get-ChildItem -Path $Root -Recurse -File | Where-Object {
     foreach ($file in $excludeFiles) {
         if ($_.Name -eq $file) { return $false }
     }
+    foreach ($pattern in $excludePatterns) {
+        if ($_.Name -like $pattern) { return $false }
+    }
     return $true
 }
 
 foreach ($file in $files) {
     $relative = $file.FullName.Substring($Root.Length + 1).Replace("\", "/")
-    $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    }
+    catch {
+        Write-Warning "Skipping locked or unreadable file: $relative"
+        continue
+    }
     $content = [Convert]::ToBase64String($bytes)
     $contentUri = "https://api.github.com/repos/$owner/$repo/contents/$relative"
     $sha = $null
